@@ -86,8 +86,11 @@ try {
     exports_?.inject?.join(', '))
   void bundled
 
-  // 6. Gate surface: the bundle carries the intercept marker and no steer affordance.
-  check('bundle carries the internal/get gate', clientSource.includes('internal/get'))
+  // 6. Gate surface: the bundle reads the raw service instance through the
+  //    cordis original symbol, re-gates on service (re)provision, and no
+  //    send-now affordance exists.
+  check('bundle reads the raw instance via the cordis original symbol', clientSource.includes('cordis.original'))
+  check('bundle re-gates on service provision events', clientSource.includes('internal/service'))
   check('bundle has no send-now affordance', !clientSource.includes('sendNow') && !clientSource.includes('send-now'))
 } catch (error) {
   check('script completed without throwing', false, `${error?.message ?? error}`)

@@ -25,19 +25,29 @@ gap entirely on the client side (no dsh source changes, no PR required):
 
 ## How it works
 
-1. The client plugin intercepts every resolution of the `conversation`
-   service (the cordis `internal/get` waterfall) and wraps its `send` /
-   `sendSession` verbs. A send addressed to a session that is **not itself
-   running** is held while any **other** session reports `running` (or a
-   release was just made for another session, bridging the short window until
-   its running flag lands in the list snapshot).
-2. Held messages (text plus any attached images, captured as base64) land in
+1. The client plugin wraps the `conversation` service's `send` /
+   `sendSession` verbs **at the instance level**: the raw service instance
+   is read through cordis's traceable proxy (the `cordis.original` symbol),
+   and the two verbs are replaced with gated wrappers on the instance itself.
+   That intercepts every read path — both `ctx.get('conversation')` (what
+   the composer's send sink uses) and `ctx.conversation` property access —
+   with the per-caller context rebinding intact. (The `internal/get`
+   waterfall only fires on property access, so a waterfall listener would
+   miss the composer sink, which reads the store directly.) A send addressed
+   to a session that is **not itself running** is held while any **other**
+   session counts as busy.
+2. A **claim** marks a session busy from the moment its turn starts — either
+   a pass-through send or a plugin release — until the host's `running` flag
+   lands in the list snapshot (a 15 s safety valve covers a turn that ends
+   before its flag lands). This closes the race where a second session could
+   start in the gap before the host confirms the first one is running.
+3. Held messages (text plus any attached images, captured as base64) land in
    a per-page queue persisted to `localStorage`, so they survive a reload.
-3. A release loop subscribes to the session-list snapshot: when no session
-   reports running, the oldest waiting session's whole batch is delivered
-   through `session.prompt` in FIFO order. Failed deliveries retry with a
-   backoff and are dropped (with a `console.error`) after 10 attempts.
-4. An **additional** `conversation.input.dock` entry (id `always-queue`,
+4. A release loop subscribes to the session-list snapshot: when no session
+   reports busy (flag or claim), the oldest waiting session's whole batch is
+   delivered through `session.prompt` in FIFO order. Failed deliveries retry
+   with a backoff and are dropped (with a `console.error`) after 10 attempts.
+5. An **additional** `conversation.input.dock` entry (id `always-queue`,
    rendered below the official queue strip) shows the held messages of the
    session you are viewing, with a pulsing "waiting" banner.
 
