@@ -1,0 +1,13 @@
+# dsh-always-queue bundle patch.
+#
+# Appends this client plugin as one row to the profile assembly tree. The
+# dsh-client-modules node half scans Loader entries that declare "dsh.client",
+# composes the package into window.__DSH_BOOT__, and serves
+# /plugins/dsh-always-queue/client.js.
+#
+# Purely additive row; nothing official is replaced. The whole behavior lives
+# browser-side: the conversation-service gate (src/client/index.ts) and the
+# pending-queue dock (src/client/dock.tsx).
+- insert:
+  - id: always-queue
+    name: dsh-always-queue
