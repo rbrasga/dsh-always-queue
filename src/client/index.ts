@@ -32,9 +32,14 @@
  *    (pass-through or release) until its running flag lands in the list
  *    snapshot (or a safety timeout), so host-flag latency can never open a
  *    second session in the gap. Liveness: a check that arrives while a
- *    release is in flight re-runs after it settles, and a sweep timer
- *    re-checks when the oldest claim expires — neither a missed running
- *    frame nor a quiet host can wedge the queue;
+ *    release is in flight re-runs after it settles, a sweep timer re-checks
+ *    when the oldest claim expires, and a stuck-gate watchdog re-pulls the
+ *    host list when the gate stays closed with a non-empty queue — a missed
+ *    running frame or a quiet host can never wedge the queue, and failed
+ *    releases retry with capped backoff instead of dropping the message;
+ * 6. traces every gate decision, claim, release and queue mutation to the
+ *    browser console under the [dsh-always-queue] prefix (plus a 30 s
+ *    heartbeat while anything is held) — the debug surface for stuck queues;
  * 5. registers an ADDITIONAL conversation.input.dock entry (id always-queue,
  *    order 30) so held messages are visible per session.
  *
@@ -68,16 +73,35 @@ const ORIGINAL = Symbol.for('cordis.original')
 const GATED = Symbol.for('dsh-always-queue.gated')
 
 /**
+ * Diagnostic console prefix. Every gate decision, claim transition, release
+ * attempt and queue mutation is traced here (console.debug) so a stuck queue
+ * is visible in the browser DevTools console without any other tooling.
+ */
+const LOG = '[dsh-always-queue]'
+
+/** One diagnostic trace line (the debug surface for the single-session gate). */
+const log = (...args: unknown[]): void => { console.debug(LOG, ...args) }
+
+/**
  * Claim safety valve: a turn that starts and finishes before its host
  * running frame lands keeps the next session waiting at most this long.
  */
 const CLAIM_TIMEOUT_MS = 15000
 
-/** Failed prompt RPCs retry this often (list updates also re-trigger). */
+/** Failed prompt RPCs retry this often, doubling per attempt (list updates also re-trigger). */
 const RELEASE_RETRY_MS = 2000
 
-/** A held message is dropped (with a console.error) after this many failed releases. */
-const MAX_RELEASE_ATTEMPTS = 10
+/** Cap of the release-retry backoff (2s doubling from RELEASE_RETRY_MS). */
+const RELEASE_RETRY_MAX_MS = 60000
+
+/**
+ * Stuck-gate watchdog: while the queue is non-empty and the gate stays closed
+ * this long (with no release in flight), the page re-pulls the host list — a
+ * client-side running flag that missed its status frame (lost frame, quiet
+ * host) self-heals against the host truth instead of holding the queue
+ * forever. The re-pull is read-only: the gate is never forced open.
+ */
+const STUCK_GATE_AFTER_MS = 60000
 
 /**
  * Provisional-title caps — mirrored from the web assembly's session-title
@@ -153,6 +177,7 @@ function firstTextOf(content: readonly PromptContentPart[]): string | undefined 
  * @param ctx - client root context.
  */
 export function apply(ctx: ClientContext): void {
+  log('client apply (browser half)')
   ctx.effect(() => ctx.locale.register(NS, { zh, en }), 'dsh-always-queue: dictionaries')
 
   const sessions = ctx.sessions
@@ -167,6 +192,10 @@ export function apply(ctx: ClientContext): void {
   let releaseQueuedAfterInflight = false
   let retryTimer: ReturnType<typeof setTimeout> | undefined
   let claimSweepTimer: ReturnType<typeof setTimeout> | undefined
+  /** When the gate last was observed closed with a non-empty queue (diagnostics). */
+  let gateClosedSince: number | undefined
+  /** One-shot timer that re-validates a long-closed gate against the host list. */
+  let stuckGateTimer: ReturnType<typeof setTimeout> | undefined
   const inFlight = new Set<string>()
 
   /**
@@ -198,6 +227,7 @@ export function apply(ctx: ClientContext): void {
       const summary = list.byId[id as SessionId]
       if (summary?.running === true || Date.now() - claim.at > CLAIM_TIMEOUT_MS) {
         claims.delete(id)
+        log('claim retired', id, summary?.running === true ? '(running flag landed)' : '(safety valve elapsed)')
       }
     }
     syncClaimSweep()
@@ -219,12 +249,104 @@ export function apply(ctx: ClientContext): void {
     return busy
   }
 
+  /**
+   * Busy rows annotated with WHAT holds them (host running flag vs plugin
+   * claim) — the diagnostics payload of every closed-gate trace.
+   */
+  const describeBusy = (list: SessionListState, busy: string[]): { id: string; kind: 'flag' | 'claim' }[] =>
+    busy.map(id => ({
+      id,
+      kind: list.byId[id as SessionId]?.running === true ? 'flag' as const : 'claim' as const,
+    }))
+
+  /**
+   * Stuck-gate state reset: the queue is empty or the gate is open, so no
+   * re-validation may be pending.
+   */
+  const resetStuckGate = (): void => {
+    gateClosedSince = undefined
+    if (stuckGateTimer !== undefined) {
+      clearTimeout(stuckGateTimer)
+      stuckGateTimer = undefined
+    }
+  }
+
+  /**
+   * Arm the stuck-gate watchdog (at most one timer): once the gate has stayed
+   * closed with a non-empty queue for STUCK_GATE_AFTER_MS, re-validate against
+   * the host list. A still-stuck gate re-arms for the next full interval, so
+   * the cadence is one read-only list pull per interval.
+   */
+  const armStuckGate = (): void => {
+    const now = Date.now()
+    if (gateClosedSince === undefined) gateClosedSince = now
+    if (stuckGateTimer !== undefined) return
+    const wait = Math.max(0, gateClosedSince + STUCK_GATE_AFTER_MS - now)
+    stuckGateTimer = setTimeout(() => {
+      stuckGateTimer = undefined
+      gateClosedSince = Date.now()
+      revalidateList()
+    }, wait)
+  }
+
+  /**
+   * Stuck-gate revalidation: re-pull the host list (and the subagent catalogs
+   * busy rows belong to) so a client-side running flag that missed its status
+   * frame converges on the host truth. The list subscription re-runs the
+   * release check with the corrected flags. Read-only — the gate is never
+   * forced open. Best effort: refresh() is a harness-runtime method absent
+   * from the narrow contract face (and from test doubles).
+   */
+  const revalidateList = (): void => {
+    const list = sessions.list.getSnapshot()
+    const busy = busyIds(list)
+    log('stuck-gate: gate closed with', pendingStore.entries().length, 'held message(s) for',
+      gateClosedSince === undefined ? 0 : Date.now() - gateClosedSince, 'ms (busy:',
+      JSON.stringify(describeBusy(list, busy)), ') — re-pulling host list')
+    const s = sessions as unknown as {
+      refresh?: () => Promise<unknown>
+      refreshSubagents?: (parentId: SessionId) => Promise<unknown>
+    }
+    try {
+      if (typeof s.refresh === 'function') {
+        void s.refresh().then(
+          () => log('stuck-gate: host list re-pulled'),
+          (error: unknown) => console.warn(LOG, 'stuck-gate: list re-pull failed', error),
+        )
+      } else {
+        console.warn(LOG, 'stuck-gate: sessions.refresh unavailable — cannot revalidate')
+      }
+      const parents = new Set<string>()
+      for (const id of busy) {
+        const parentId = list.byId[id as SessionId]?.parentId
+        if (parentId !== undefined) parents.add(parentId)
+      }
+      for (const parentId of parents) {
+        if (typeof s.refreshSubagents !== 'function') break
+        void s.refreshSubagents(parentId as SessionId).catch(() => {})
+      }
+    } catch (error) {
+      console.warn(LOG, 'stuck-gate: revalidation threw', error)
+    }
+  }
+
   /** Best-effort composer notice that a message was held (no scope, silent). */
   const notifyHeld = (sessionId: string): void => {
     try {
       const actx = sessions.scope(sessionId as SessionId)
       if (actx === undefined) return
       hubInput?.for(actx).notify('info', t('queued'))
+    } catch {
+      /* best-effort only */
+    }
+  }
+
+  /** Best-effort composer notice that a held message's release failed (or vanished). */
+  const notifyReleaseFailure = (sessionId: string, text: string): void => {
+    try {
+      const actx = sessions.scope(sessionId as SessionId)
+      if (actx === undefined) return
+      hubInput?.for(actx).notify('error', text)
     } catch {
       /* best-effort only */
     }
@@ -321,9 +443,14 @@ export function apply(ctx: ClientContext): void {
     // exactly as without the plugin.
     if (mode === 'steer' && !targetRunning) return passThrough()
 
+    const busy = busyIds(list)
     const verdict = decideGate({
       targetRunning,
-      otherBusy: busyIds(list).some(id => id !== targetId),
+      otherBusy: busy.some(id => id !== targetId),
+    })
+    log('gate', {
+      prop, targetId, mode: mode ?? null, phase: list.phase, targetRunning,
+      busy: describeBusy(list, busy), verdict,
     })
     if (verdict !== 'hold') {
       // A pass-through send to an idle session starts a turn: claim it so
@@ -331,6 +458,7 @@ export function apply(ctx: ClientContext): void {
       if (!targetRunning) {
         claims.set(targetId, { at: Date.now() })
         syncClaimSweep()
+        log('claim set (pass-through send)', targetId)
       }
       return passThrough()
     }
@@ -379,7 +507,13 @@ export function apply(ctx: ClientContext): void {
       content = [{ type: 'text' as const, text }]
     }
 
-    pendingStore.add({ sessionId: targetId, content })
+    const held = pendingStore.add({ sessionId: targetId, content })
+    log('held', {
+      sessionId: targetId, id: held.id,
+      parts: content.map(part => part.type).join(','),
+      queueLength: pendingStore.entries().length,
+      busy: describeBusy(list, busyIds(list)),
+    })
 
     // Engage the target locally (un-blank it for the list / New Session flow)
     // and give it its provisional title — the same first-five-words text the
@@ -424,6 +558,7 @@ export function apply(ctx: ClientContext): void {
     'internal/service',
     (name: string, value: unknown) => {
       if (name !== 'conversation' || value === undefined || value === null) return
+      log('re-gate: internal/service event for', name)
       patchConversation(value)
     },
     { global: true },
@@ -442,18 +577,40 @@ export function apply(ctx: ClientContext): void {
     // after the in-flight batch settles, so no frame is ever lost.
     if (releasing) {
       releaseQueuedAfterInflight = true
+      log('release: skip (release in flight — re-check queued)')
       return
     }
     const list = sessions.list.getSnapshot()
     retireClaims(list)
-    if (list.phase !== 'ready') return
+    if (list.phase !== 'ready') {
+      resetStuckGate()
+      log('release: skip (list phase', list.phase + ')')
+      return
+    }
     const entries = pendingStore.entries().filter(entry => !inFlight.has(entry.id))
-    if (entries.length === 0) return
-    if (busyIds(list).length > 0) return
+    if (entries.length === 0) {
+      resetStuckGate()
+      return
+    }
+    const busy = busyIds(list)
+    if (busy.length > 0) {
+      // Gate closed: hold the queue. If it STAYS closed while messages wait,
+      // the watchdog re-validates the client flags against the host list —
+      // a missed status frame must never wedge a held message forever.
+      armStuckGate()
+      log('release: hold (gate closed by', JSON.stringify(describeBusy(list, busy)),
+        '; pending sessions:', [...new Set(entries.map(e => e.sessionId))].join(','), ')')
+      return
+    }
     const batch = releaseBatch(entries)
-    if (batch.length === 0) return
+    if (batch.length === 0) {
+      resetStuckGate()
+      return
+    }
 
+    resetStuckGate() // gate open: the release starts
     releasing = true
+    log('release: start batch for session', batch[0]?.sessionId, '(', batch.length, 'entries)')
     void (async () => {
       let releasedSession: string | undefined
       try {
@@ -461,11 +618,18 @@ export function apply(ctx: ClientContext): void {
           inFlight.add(entry.id)
           const binding = sessions.binding(entry.sessionId as SessionId)
           if (binding === undefined) {
-            // The session vanished while its message waited: drop it.
+            // The session vanished while its message waited: drop it — but
+            // say so (a silent loss reads as "the message was forgotten").
             pendingStore.remove(entry.id)
             inFlight.delete(entry.id)
+            console.error(LOG, 'dropping held message: session vanished from the list before release', {
+              sessionId: entry.sessionId, id: entry.id,
+            })
+            notifyReleaseFailure(entry.sessionId, t('releaseGone'))
             continue
           }
+          log('release: prompt →', entry.sessionId, 'entry', entry.id,
+            'attempt', entry.attempts + 1, 'parts:', entry.content.map(part => part.type).join(','))
           let result: RpcResult<{ accepted: true }>
           try {
             result = await binding.session.prompt(entry.content, 'queue')
@@ -476,19 +640,34 @@ export function apply(ctx: ClientContext): void {
           if (result.ok === true) {
             pendingStore.remove(entry.id)
             releasedSession ??= entry.sessionId
+            log('release: delivered', entry.sessionId, 'entry', entry.id)
             continue
           }
+          // Failed release: NEVER drop the message silently. Keep it at the
+          // head with capped exponential backoff (list updates re-trigger
+          // independently), and tell the user it is still queued.
           const attempts = entry.attempts + 1
-          if (attempts >= MAX_RELEASE_ATTEMPTS) {
+          log('release: FAILED', entry.sessionId, 'entry', entry.id,
+            'attempt', attempts, 'error:', JSON.stringify(result.error))
+          if (result.error?.code === 'session-not-found') {
+            // The host removed the session: nowhere left to deliver to.
             pendingStore.remove(entry.id)
-            console.error('[dsh-always-queue] giving up on a held message', {
-              sessionId: entry.sessionId,
-              error: result.error,
+            console.error(LOG, 'dropping held message: target session no longer exists on the host', {
+              sessionId: entry.sessionId, id: entry.id, error: result.error,
             })
+            notifyReleaseFailure(entry.sessionId, t('releaseGone'))
             break
           }
           pendingStore.requeueFront({ ...entry, attempts })
-          retryTimer = setTimeout(checkRelease, RELEASE_RETRY_MS)
+          const delay = Math.min(
+            RELEASE_RETRY_MS * 2 ** Math.min(attempts - 1, 6),
+            RELEASE_RETRY_MAX_MS,
+          )
+          retryTimer = setTimeout(checkRelease, delay)
+          if (attempts === 1 || attempts % 5 === 0) {
+            notifyReleaseFailure(entry.sessionId,
+              t('releaseFailed', { n: attempts, code: result.error?.code ?? 'unknown' }))
+          }
           break
         }
         if (releasedSession !== undefined) {
@@ -497,6 +676,7 @@ export function apply(ctx: ClientContext): void {
           // then re-checks even if no further list update ever arrives).
           claims.set(releasedSession, { at: Date.now() })
           syncClaimSweep()
+          log('claim set (release)', releasedSession)
         }
       } finally {
         releasing = false
@@ -511,14 +691,40 @@ export function apply(ctx: ClientContext): void {
   // Subscribe the release loop to the session list (status frames drive it);
   // run once at boot to pick up a persisted queue after a reload.
   ctx.effect(() => {
+    log('release loop subscribed (boot entries:', pendingStore.entries().length, ')')
     const off = sessions.list.subscribe(() => checkRelease())
     checkRelease()
     return () => {
+      log('release loop torn down')
       off()
       if (retryTimer !== undefined) clearTimeout(retryTimer)
       if (claimSweepTimer !== undefined) clearTimeout(claimSweepTimer)
+      if (stuckGateTimer !== undefined) clearTimeout(stuckGateTimer)
     }
   }, 'dsh-always-queue: release loop')
+
+  // Diagnostics heartbeat: while anything is held, a 30 s console trace of
+  // the whole gate state — the debug surface for "my queued session never
+  // starts". Quiet while the queue is empty (no console noise in normal use).
+  ctx.effect(() => {
+    const timer = setInterval(() => {
+      const entries = pendingStore.entries()
+      if (entries.length === 0) return
+      const list = sessions.list.getSnapshot()
+      log('heartbeat', {
+        phase: list.phase,
+        pending: entries.map(e => ({
+          id: e.id, sessionId: e.sessionId, attempts: e.attempts,
+          ageMs: Date.now() - e.queuedAt,
+        })),
+        busy: describeBusy(list, busyIds(list)),
+        claims: [...claims.entries()].map(([id, c]) => ({ id, ageMs: Date.now() - c.at })),
+        releasing,
+        gateClosedForMs: gateClosedSince === undefined ? 0 : Date.now() - gateClosedSince,
+      })
+    }, 30000)
+    return () => { clearInterval(timer) }
+  }, 'dsh-always-queue: diagnostics heartbeat')
 
   // The pending strip: an ADDITIONAL input-dock entry (never shadows the
   // official queue strip, so the per-session inbox UI stays untouched).

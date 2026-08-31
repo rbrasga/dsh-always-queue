@@ -21,6 +21,10 @@ export const zh = {
   'remove': '移出队列',
   /** Composer notice when a message was held by the gate. */
   'queued': '已排队：其他会话结束或暂停后自动发送',
+  /** Composer notice: a held message's release keeps failing ({n} attempts, {code} host error code). */
+  'releaseFailed': '发送失败（第 {n} 次，{code}）：消息保留在队列中，将继续自动重试',
+  /** Composer notice: a held message could not be delivered (target session gone). */
+  'releaseGone': '排队消息无法发送：目标会话已不存在，该条消息已移出队列',
 } satisfies Record<string, string>
 
 /** English dictionary (keys mirror zh). */
@@ -33,4 +37,6 @@ export const en: Record<keyof typeof zh, string> = {
   'pullBack.busy': 'The composer has content — send or clear it first',
   'remove': 'Remove from queue',
   'queued': 'Queued: will send automatically once other sessions finish or pause',
+  'releaseFailed': 'Send failed (attempt {n}, {code}): message kept in queue, retrying automatically',
+  'releaseGone': 'Queued message could not be sent: the target session no longer exists — entry removed',
 }

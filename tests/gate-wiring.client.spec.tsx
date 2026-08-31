@@ -71,6 +71,8 @@ interface Harness {
   prompts: { sessionId: string; content: unknown[]; mode: string }[]
   sessionFaces: Map<string, FakeSessionFace>
   renames: { sessionId: string; title: string }[]
+  /** The fake sessions service (exposes refresh() for the stuck-gate watchdog). */
+  sessions: { refresh: ReturnType<typeof vi.fn> }
   /** Set the caller context the next plain send's shadow resolves. */
   setCallerCtx: (ctx: unknown) => void
   callerCtxs: Map<object, string>
@@ -100,6 +102,7 @@ function makeHarness(initialList: FakeList): Harness {
     prompts: [],
     sessionFaces: new Map(),
     renames: [],
+    sessions: { refresh: undefined as unknown as ReturnType<typeof vi.fn> },
     setCallerCtx: () => {},
     callerCtxs: new Map(),
     emitService: () => {},
@@ -184,6 +187,9 @@ function makeHarness(initialList: FakeList): Harness {
   // --- fake services.
   const sessionsService = {
     list: listStore,
+    // Mirrors the concrete SessionRuntime method the stuck-gate watchdog
+    // reaches for (best effort, outside the narrow contract face).
+    refresh: vi.fn(async () => {}),
     scope: (id: string) => ({ __actx: id }),
     scopeOf: (ctx: unknown) => callerCtxsOf.get(ctx),
     binding: (id: string) => {
@@ -195,6 +201,7 @@ function makeHarness(initialList: FakeList): Harness {
       return { sessionId: id, session: face2, ctx: {} }
     },
   }
+  h.sessions = { refresh: sessionsService.refresh }
   const callerCtxsOf = h.callerCtxs
   const localeService = {
     register: () => {},
@@ -506,6 +513,65 @@ describe('gate wiring', () => {
       // timer must wake the queue when the claim expires.
       await vi.advanceTimersByTimeAsync(15000 + 1000)
       expect(h.prompts.map(p => p.sessionId)).toEqual(['B', 'C'])
+      expect(pendingStore.entries()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('re-validates a stuck gate against the host list, then releases', async () => {
+    vi.useFakeTimers()
+    try {
+      const h = makeHarness(listWith({ A: true, B: false }))
+      // The re-pull converges on host truth: A is no longer running (its
+      // running:false status frame was lost client-side).
+      h.sessions.refresh.mockImplementation(async () => {
+        h.setList(listWith({ A: false, B: false }))
+      })
+      await h.face.sendSession({ sessionId: 'B' }, 'hello B', [], 'queue')
+      expect(pendingStore.entries()).toHaveLength(1)
+      // Gate closed by A's flag and the host goes quiet. Before the watchdog
+      // cadence nothing re-pulls and nothing releases.
+      await vi.advanceTimersByTimeAsync(59_000)
+      expect(h.sessions.refresh).not.toHaveBeenCalled()
+      expect(h.prompts).toEqual([])
+      // At 60 s the watchdog re-pulls the host list; the corrected snapshot
+      // releases B.
+      await vi.advanceTimersByTimeAsync(1_000)
+      expect(h.sessions.refresh).toHaveBeenCalledTimes(1)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.prompts.map(p => p.sessionId)).toEqual(['B'])
+      expect(pendingStore.entries()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('keeps a failed release queued with backoff instead of dropping it', async () => {
+    vi.useFakeTimers()
+    try {
+      const h = makeHarness(listWith({ A: true, B: false }))
+      const face = h.sessionFaces.get('B')
+      if (face === undefined) throw new Error('no face for B')
+      face.prompt = vi.fn(async () => ({ ok: false, error: { code: 'agent-busy', message: 'prompt rejected', details: {} } }))
+      await h.face.sendSession({ sessionId: 'B' }, 'hello B', [], 'queue')
+      expect(pendingStore.entries()).toHaveLength(1)
+      // A completes: the release fails (host rejects — the failing double
+      // records nothing in h.prompts).
+      h.setList(listWith({ A: false, B: false }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.prompts).toEqual([])
+      // The message is NOT dropped — it waits out the 2 s backoff with its
+      // attempt count carried, then retries (attempt 2 succeeds once the
+      // host recovers).
+      expect(pendingStore.entries().map(e => [e.sessionId, e.attempts])).toEqual([['B', 1]])
+      face.prompt = vi.fn(async () => {
+        h.prompts.push({ sessionId: 'B', content: [{ type: 'text', text: 'hello B' }], mode: 'queue' })
+        return { ok: true, value: { accepted: true } }
+      })
+      await vi.advanceTimersByTimeAsync(2_000)
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.prompts.map(p => p.sessionId)).toEqual(['B'])
       expect(pendingStore.entries()).toEqual([])
     } finally {
       vi.useRealTimers()

@@ -82,7 +82,10 @@ export function AlwaysQueueDock({ sessionId, input, setDraft, t }: AlwaysQueueDo
                       aria-label={t('pullBack')}
                       title={pullBackLabel}
                       disabled={pullBackDisabled}
-                      onClick={() => { pullBack(entry) }}
+                      onClick={() => {
+                        console.debug('[dsh-always-queue] dock: user pulled back entry', entry.id, 'for session', sid)
+                        pullBack(entry)
+                      }}
                     >
                       <IconRightUpOutline16 />
                     </button>
@@ -93,7 +96,10 @@ export function AlwaysQueueDock({ sessionId, input, setDraft, t }: AlwaysQueueDo
                       className={css.action}
                       aria-label={t('remove')}
                       title={t('remove')}
-                      onClick={() => { pendingStore.remove(entry.id) }}
+                      onClick={() => {
+                        console.debug('[dsh-always-queue] dock: user removed entry', entry.id, 'for session', sid)
+                        pendingStore.remove(entry.id)
+                      }}
                     >
                       <IconTrashOutline16 size={14} />
                     </button>

@@ -111,7 +111,14 @@ function rehydrate(): PendingEntry[] {
   }
 }
 
-/** Persist the queue (quota/private-mode failures only disable persistence). */
+/** Throttle for persist-failure warnings (one per minute). */
+let lastPersistWarnAt = 0
+
+/**
+ * Persist the queue. Quota/private-mode failures only disable persistence —
+ * but they are traced (throttled), because silent persistence loss is exactly
+ * how a held message "disappears" on the next reload.
+ */
 function persist(entries: readonly PendingEntry[]): void {
   try {
     const stored: StoredEntry[] = entries.map((entry) => ({
@@ -122,8 +129,12 @@ function persist(entries: readonly PendingEntry[]): void {
       attempts: entry.attempts,
     }))
     globalThis.localStorage?.setItem(STORAGE_KEY, JSON.stringify(stored))
-  } catch {
-    /* storage unavailable: in-memory only */
+  } catch (error: unknown) {
+    const now = Date.now()
+    if (now - lastPersistWarnAt >= 60000) {
+      lastPersistWarnAt = now
+      console.warn('[dsh-always-queue] localStorage persist FAILED — held messages will not survive a reload', error)
+    }
   }
 }
 
@@ -199,11 +210,16 @@ export const pendingStore = {
 
   /**
    * Put one failed release back at the head (it retries before anything held
-   * later), carrying the incremented attempt count.
+   * later), carrying the incremented attempt count. Replaces the stored copy
+   * of the same id — the entry stays in the queue while it retries, so a
+   * no-op here would freeze the attempt count (and any backoff built on it).
    */
   requeueFront(entry: PendingEntry): void {
-    if (state.some(e => e.id === entry.id)) return
-    state = [entry, ...state]
+    if (state.some(e => e.id === entry.id)) {
+      state = [entry, ...state.filter(e => e.id !== entry.id)]
+    } else {
+      state = [entry, ...state]
+    }
     mutate()
   },
 

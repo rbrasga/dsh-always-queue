@@ -57,9 +57,26 @@ gap entirely on the client side (no dsh source changes, no PR required):
    when the message releases — so the sidebar shows it like the normal flow.
 5. A release loop subscribes to the session-list snapshot: when no session
    reports busy (flag or claim), the oldest waiting session's whole batch is
-   delivered through `session.prompt` in FIFO order. Failed deliveries retry
-   with a backoff and are dropped (with a `console.error`) after 10 attempts.
-6. An **additional** `conversation.input.dock` entry (id `always-queue`,
+   delivered through `session.prompt` in FIFO order. Failed deliveries are
+   **never dropped silently**: the message stays at the head of the queue
+   with capped exponential backoff (2 s to 60 s), the session's composer
+   gets an error notice, and every attempt is traced to the console. The
+   only drops are the unrecoverable ones (the target session no longer
+   exists on the host), and even those are announced via `console.error`
+   plus a composer notice.
+6. A **stuck-gate watchdog**: if the gate stays closed with a non-empty
+   queue for 60 s, the page re-pulls the host session list (read-only; the
+   gate is never forced open). A client-side `running` flag that missed its
+   status frame (lost frame, quiet host) self-heals against the host truth
+   within a minute instead of holding the queue forever.
+7. **Diagnostics**: every gate decision, claim transition, release attempt
+   and queue mutation is traced to the browser console under the
+   `[dsh-always-queue]` prefix, plus a 30 s state heartbeat while anything
+   is held (`pending` / `busy` (host `flag` vs plugin `claim`) / `claims`/
+   `releasing` / `gateClosedForMs`). That is the debug surface for "my
+   queued session never starts": the busy rows name the exact session(s)
+   holding the gate.
+8. An **additional** `conversation.input.dock` entry (id `always-queue`,
    rendered below the official queue strip) shows the held messages of the
    session you are viewing, with a pulsing "waiting" banner.
 
@@ -89,6 +106,22 @@ removing it is `npx @deepseek-ai/dsh plugin --profile web remove dsh-always-queu
   starts immediately, exactly like the default.
 - Slash commands are not gated (only plain message sends go through the
   composer sink this plugin wraps).
+
+## Troubleshooting a stuck queue
+
+1. Open the browser DevTools console on the GUI page and filter for
+   `dsh-always-queue`. While anything is held, a 30 s heartbeat prints the
+   whole gate state; the `busy` list names the session(s) holding the gate
+   and whether each hold is a host `running` **flag** or a plugin **claim**.
+2. If a `flag` keeps holding the gate while that session is visibly idle,
+   the watchdog re-pulls the host list after 60 s (log:
+   `stuck-gate: ... re-pulling host list`); a following `release: start
+   batch` means the queue recovered on its own.
+3. Repeated `release: FAILED` lines mean the host is rejecting the prompt
+   RPC; the `error` JSON names the code (e.g. `model-unavailable` when no
+   adapter serves the session's model). The message stays queued and keeps
+   retrying.
+4. `dock: user removed/pulled back entry` lines rule out manual removal.
 
 ## Limitations
 
