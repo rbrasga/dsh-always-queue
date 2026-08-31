@@ -41,13 +41,25 @@ gap entirely on the client side (no dsh source changes, no PR required):
    lands in the list snapshot (a 15 s safety valve covers a turn that ends
    before its flag lands). This closes the race where a second session could
    start in the gap before the host confirms the first one is running.
-3. Held messages (text plus any attached images, captured as base64) land in
-   a per-page queue persisted to `localStorage`, so they survive a reload.
-4. A release loop subscribes to the session-list snapshot: when no session
+   Release liveness is closed off: a check that lands while a release is in
+   flight re-runs after it settles, and a sweep timer re-checks when the
+   oldest claim expires — a lost status frame or a quiet host can never wedge
+   the queue.
+3. A held message (text plus any attached images, captured as base64) lands
+   in a per-page queue persisted to `localStorage`, so it survives a reload.
+4. A held first send also **engages** its session locally (the harness's own
+   first-send flip: `promptAttempted` / `blankBit` / `onEngaged`), so the list
+   row stops reporting blank. Without this, the New Session flow would keep
+   reusing the still-blank session and a second new session would be
+   uncreatable while the first one's message waits. The same hold assigns the
+   session its provisional title via `rename` — the deterministic
+   first-five-words fallback, byte-identical to the title the host would fold
+   when the message releases — so the sidebar shows it like the normal flow.
+5. A release loop subscribes to the session-list snapshot: when no session
    reports busy (flag or claim), the oldest waiting session's whole batch is
    delivered through `session.prompt` in FIFO order. Failed deliveries retry
    with a backoff and are dropped (with a `console.error`) after 10 attempts.
-5. An **additional** `conversation.input.dock` entry (id `always-queue`,
+6. An **additional** `conversation.input.dock` entry (id `always-queue`,
    rendered below the official queue strip) shows the held messages of the
    session you are viewing, with a pulsing "waiting" banner.
 
@@ -87,6 +99,14 @@ removing it is `npx @deepseek-ai/dsh plugin --profile web remove dsh-always-queu
 - Image attachments on held messages are captured as base64 at hold time;
   very large image sets are bounded by the localStorage quota (5 MB) — if the
   quota is hit, persistence degrades to in-memory for that page.
+- The provisional title rides the host rename channel, so it counts as a user
+  title (pinned): a later automatic title revision (e.g. an LLM refinement)
+  will not replace it. The text assigned is exactly the fallback the
+  automatic path would produce, and a manual rename supersedes it at any
+  time.
+- The engagement flip touches harness-internal session fields (best effort).
+  If a future harness release renames them, holds still work; only the
+  second-New-Session and provisional-title conveniences degrade.
 
 ## Build / verify
 

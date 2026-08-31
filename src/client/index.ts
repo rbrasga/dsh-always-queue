@@ -17,13 +17,25 @@
  *    send-immediately path for held messages. Sends to the running session
  *    pass through untouched, so the default in-session queueing and steer
  *    behavior is preserved exactly;
- * 3. runs the release loop: when nothing is busy, the oldest waiting
+ * 3. a HELD first send mirrors the harness's first-send engagement on the
+ *    target session (promptAttempted / blankBit flip + onEngaged list
+ *    mutation): without it the session would stay blank in every client
+ *    projection — the New Session flow reuses blank sessions, so the user
+ *    could not create a second new session while the first one's message
+ *    waited. The same hold assigns the session its provisional title via
+ *    rename (the deterministic first-five-words fallback, byte-identical to
+ *    the title the host would derive when the message releases), so the
+ *    sidebar shows it like the normal flow instead of the workspace name;
+ * 4. runs the release loop: when nothing is busy, the oldest waiting
  *    session's whole batch is released through session.prompt in FIFO order.
  *    A CLAIM marks a session busy from the moment its turn starts
  *    (pass-through or release) until its running flag lands in the list
  *    snapshot (or a safety timeout), so host-flag latency can never open a
- *    second session in the gap;
- * 4. registers an ADDITIONAL conversation.input.dock entry (id always-queue,
+ *    second session in the gap. Liveness: a check that arrives while a
+ *    release is in flight re-runs after it settles, and a sweep timer
+ *    re-checks when the oldest claim expires — neither a missed running
+ *    frame nor a quiet host can wedge the queue;
+ * 5. registers an ADDITIONAL conversation.input.dock entry (id always-queue,
  *    order 30) so held messages are visible per session.
  *
  * All @deepseek-ai/* imports are type-only: collaboration happens through
@@ -67,6 +79,27 @@ const RELEASE_RETRY_MS = 2000
 /** A held message is dropped (with a console.error) after this many failed releases. */
 const MAX_RELEASE_ATTEMPTS = 10
 
+/**
+ * Provisional-title caps — mirrored from the web assembly's session-title
+ * configuration (fallbackMaxWords/fallbackMaxBytes), so a held first send
+ * titles the session with exactly the text the host's fallback would.
+ */
+const TITLE_FALLBACK_MAX_WORDS = 5
+const TITLE_FALLBACK_MAX_BYTES = 40
+
+/**
+ * Control-escape sanitization — mirrors the harness title normalization
+ * verbatim; the control characters are the point (they are stripped from
+ * title text).
+ */
+/* eslint-disable no-control-regex -- intentional: mirrors the harness sanitizer */
+const TITLE_OSC = /(?:\u001B\]|\u009D)(?:(?!\u0007|\u001B\\)[\s\S])*(?:\u0007|\u001B\\|$)/gu
+const TITLE_CSI = /(?:\u001B\[|\u001B)[0-?]*[ -/]*[@-~]/gu
+const TITLE_ESC = /\u001B[@-_]/gu
+const TITLE_CONTROL = /[\u0000-\u0008\u000B\u000C\u000E-\u001F\u007F-\u009F]/gu
+const TITLE_DIRECTIONAL = /[\u200B\u200E\u200F\u202A-\u202E\u2060-\u2064\u2066-\u206F\uFEFF]/gu
+/* eslint-enable no-control-regex */
+
 /** The input-hub face the gate reaches for composer notices. */
 interface InputHubLike {
   for(actx: unknown): {
@@ -76,6 +109,43 @@ interface InputHubLike {
 
 /** A verb pair on the conversation service instance. */
 type GateVerbs = 'send' | 'sendSession'
+
+/**
+ * Derive the deterministic first-five-words fallback title (the same text
+ * the host would fold at release time: sanitized, whitespace-collapsed,
+ * five leading words, capped at 40 UTF-8 bytes without splitting a code
+ * point).
+ * @param input - raw first-message text.
+ * @returns the normalized title text, possibly empty.
+ */
+function fallbackTitle(input: string): string {
+  const cleaned = input
+    .replace(TITLE_OSC, '')
+    .replace(TITLE_CSI, '')
+    .replace(TITLE_ESC, '')
+    .replace(TITLE_CONTROL, '')
+    .replace(TITLE_DIRECTIONAL, '')
+    .replace(/\s+/gu, ' ')
+    .trim()
+  const words = cleaned.split(' ').filter(Boolean).slice(0, TITLE_FALLBACK_MAX_WORDS)
+  let used = 0
+  let output = ''
+  for (const character of words.join(' ')) {
+    const bytes = new TextEncoder().encode(character).length
+    if (used + bytes > TITLE_FALLBACK_MAX_BYTES) break
+    output += character
+    used += bytes
+  }
+  return output.trimEnd()
+}
+
+/** The first text part of a held content (the title source), if any. */
+function firstTextOf(content: readonly PromptContentPart[]): string | undefined {
+  for (const part of content) {
+    if (part.type === 'text') return part.text
+  }
+  return undefined
+}
 
 /**
  * Client plugin body: dictionaries, the conversation-service gate, the
@@ -93,8 +163,30 @@ export function apply(ctx: ClientContext): void {
   /** SessionId -> claim timestamp: busy from turn start until the running flag lands. */
   const claims = new Map<string, { at: number }>()
   let releasing = false
+  /** A check arrived while a release was in flight: re-run it when that settles. */
+  let releaseQueuedAfterInflight = false
   let retryTimer: ReturnType<typeof setTimeout> | undefined
+  let claimSweepTimer: ReturnType<typeof setTimeout> | undefined
   const inFlight = new Set<string>()
+
+  /**
+   * Re-arm the sweep timer: re-check when the OLDEST active claim expires
+   * (plus a margin). Nothing else may be required to wake the queue — a
+   * missed running frame or a quiet host must not wedge a held message.
+   */
+  const syncClaimSweep = (): void => {
+    if (claimSweepTimer !== undefined) {
+      clearTimeout(claimSweepTimer)
+      claimSweepTimer = undefined
+    }
+    let soonest: number | undefined
+    for (const claim of claims.values()) {
+      soonest = soonest === undefined ? claim.at : Math.min(soonest, claim.at)
+    }
+    if (soonest === undefined) return
+    const delay = Math.max(50, soonest + CLAIM_TIMEOUT_MS + 50 - Date.now())
+    claimSweepTimer = setTimeout(checkRelease, delay)
+  }
 
   /**
    * Retire claims: dropped once the host running flag confirms the turn
@@ -108,6 +200,7 @@ export function apply(ctx: ClientContext): void {
         claims.delete(id)
       }
     }
+    syncClaimSweep()
   }
 
   /** Every session that currently counts as in progress (flag or claim). */
@@ -135,6 +228,61 @@ export function apply(ctx: ClientContext): void {
     } catch {
       /* best-effort only */
     }
+  }
+
+  /**
+   * Mirror the harness's first-send engagement on a held session, so the
+   * client list row stops reporting blank: a held prompt is never admitted
+   * by the host, so without this the session stays blank in every client
+   * projection — and the New Session flow reuses blank sessions, making a
+   * second new session uncreatable while the first one's message waits.
+   * Best effort: the fields are harness-internal (Session instance); if
+   * the shape ever changes the hold still works and only the reuse quirk
+   * returns.
+   * @param session - the target session face from the binding.
+   */
+  const engageSession = (session: object | undefined): void => {
+    if (session === undefined) return
+    try {
+      const s = session as Record<string, unknown>
+      s.promptAttempted = true
+      if (s.blankBit === true) {
+        s.blankBit = false
+        s.firstPromptPendingTurn = true
+        const options = s.options as { onEngaged?: (session: object) => void } | undefined
+        options?.onEngaged?.(session)
+      }
+      const notifier = s.notifier as { markDirty?: () => void } | undefined
+      notifier?.markDirty?.()
+    } catch {
+      /* best-effort only */
+    }
+  }
+
+  /**
+   * Give a held blank session its provisional title: the deterministic
+   * first-five-words fallback, exactly the text the host would derive when
+   * the message releases. Rename pins the title (user source), which
+   * suppresses later automatic revision — acceptable because the provisional
+   * text IS the fallback the automatic path would produce. Best effort:
+   * failures leave the title for the release path to derive.
+   * @param binding - target session binding, if eligible.
+   * @param summary - target row from the list snapshot at hold time.
+   * @param text - first text part of the held content.
+   */
+  const provisionTitle = (
+    binding: { session: { rename(title: string): Promise<unknown> } } | undefined,
+    summary: { blank?: boolean; title?: string } | undefined,
+    text: string | undefined,
+  ): void => {
+    if (binding === undefined || summary === undefined) return
+    if (summary.blank !== true || summary.title !== undefined) return
+    if (text === undefined || text.trim() === '') return
+    const title = fallbackTitle(text)
+    if (title.length === 0) return
+    void binding.session.rename(title).catch(() => {
+      /* best-effort only */
+    })
   }
 
   /**
@@ -180,7 +328,10 @@ export function apply(ctx: ClientContext): void {
     if (verdict !== 'hold') {
       // A pass-through send to an idle session starts a turn: claim it so
       // host-flag latency cannot open a second session in the gap.
-      if (!targetRunning) claims.set(targetId, { at: Date.now() })
+      if (!targetRunning) {
+        claims.set(targetId, { at: Date.now() })
+        syncClaimSweep()
+      }
       return passThrough()
     }
 
@@ -229,6 +380,18 @@ export function apply(ctx: ClientContext): void {
     }
 
     pendingStore.add({ sessionId: targetId, content })
+
+    // Engage the target locally (un-blank it for the list / New Session flow)
+    // and give it its provisional title — the same first-five-words text the
+    // host would derive when the message releases.
+    const binding = sessions.binding(targetId as SessionId)
+    engageSession(binding?.session)
+    provisionTitle(
+      binding === undefined ? undefined : { session: binding.session },
+      list.byId[targetId as SessionId],
+      firstTextOf(content),
+    )
+
     notifyHeld(targetId)
     checkRelease() // close the race: the busy session may have just finished
     return prop === 'sendSession' ? { kind: 'success' } : undefined
@@ -275,7 +438,12 @@ export function apply(ctx: ClientContext): void {
    * in-flight entries).
    */
   const checkRelease = (): void => {
-    if (releasing) return
+    // A check arriving mid-release (a status frame racing the RPC) re-runs
+    // after the in-flight batch settles, so no frame is ever lost.
+    if (releasing) {
+      releaseQueuedAfterInflight = true
+      return
+    }
     const list = sessions.list.getSnapshot()
     retireClaims(list)
     if (list.phase !== 'ready') return
@@ -325,11 +493,17 @@ export function apply(ctx: ClientContext): void {
         }
         if (releasedSession !== undefined) {
           // Claim the released session: it counts as busy until its running
-          // flag lands (or the claim safety valve elapses).
+          // flag lands (or the claim safety valve elapses — the sweep timer
+          // then re-checks even if no further list update ever arrives).
           claims.set(releasedSession, { at: Date.now() })
+          syncClaimSweep()
         }
       } finally {
         releasing = false
+        if (releaseQueuedAfterInflight) {
+          releaseQueuedAfterInflight = false
+          checkRelease()
+        }
       }
     })()
   }
@@ -342,6 +516,7 @@ export function apply(ctx: ClientContext): void {
     return () => {
       off()
       if (retryTimer !== undefined) clearTimeout(retryTimer)
+      if (claimSweepTimer !== undefined) clearTimeout(claimSweepTimer)
     }
   }, 'dsh-always-queue: release loop')
 

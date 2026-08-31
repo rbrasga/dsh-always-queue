@@ -9,7 +9,7 @@
  * covers the flag-landing race (claims), steer pass-through, and
  * re-provision re-patching.
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { ReactNode } from 'react'
 import { apply, inject } from '../src/client/index.ts'
 import { pendingStore } from '../src/client/pending-store.ts'
@@ -29,7 +29,19 @@ const flush = (): Promise<void> => new Promise(resolve => setImmediate(resolve))
 const ORIGINAL = Symbol.for('cordis.original')
 const GATED = Symbol.for('dsh-always-queue.gated')
 
-interface FakeSummary { id: string; displayTitle: string; running: boolean; blank: boolean; updatedAt: number }
+interface FakeSummary { id: string; displayTitle: string; running: boolean; blank: boolean; updatedAt: number; title?: string }
+
+/** One fake session face: prompt/rename verbs plus the harness-internal engagement fields. */
+interface FakeSessionFace {
+  sessionId: string
+  prompt: ReturnType<typeof vi.fn>
+  rename: ReturnType<typeof vi.fn>
+  promptAttempted: boolean
+  blankBit: boolean
+  firstPromptPendingTurn: boolean
+  options: { onEngaged: ReturnType<typeof vi.fn> }
+  notifier: { markDirty: ReturnType<typeof vi.fn> }
+}
 interface FakeList {
   ids: string[]
   byId: Record<string, FakeSummary>
@@ -57,13 +69,19 @@ interface Harness {
   serialized: string[][]
   released: string[]
   prompts: { sessionId: string; content: unknown[]; mode: string }[]
-  sessionFaces: Map<string, { sessionId: string; prompt: ReturnType<typeof vi.fn> }>
+  sessionFaces: Map<string, FakeSessionFace>
+  renames: { sessionId: string; title: string }[]
   /** Set the caller context the next plain send's shadow resolves. */
   setCallerCtx: (ctx: unknown) => void
   callerCtxs: Map<object, string>
   /** Fire the internal/service event with a (re)provisioned value. */
   emitService: (name: string, value: unknown) => void
+  /** Run the fiber effect cleanups (clears the plugin's timers). */
+  dispose: () => void
 }
+
+/** The harness under test (disposed in afterEach to clear plugin timers). */
+let activeHarness: Harness | undefined
 
 function makeHarness(initialList: FakeList): Harness {
   const h: Harness = {
@@ -81,12 +99,15 @@ function makeHarness(initialList: FakeList): Harness {
     released: [],
     prompts: [],
     sessionFaces: new Map(),
+    renames: [],
     setCallerCtx: () => {},
     callerCtxs: new Map(),
     emitService: () => {},
+    dispose: () => {},
   }
 
-  // --- fake session faces (one per listed session).
+  // --- fake session faces (one per listed session): prompt + rename plus
+  //     the harness-internal engagement fields the plugin mirrors on hold.
   for (const id of initialList.ids) {
     h.sessionFaces.set(id, {
       sessionId: id,
@@ -94,6 +115,15 @@ function makeHarness(initialList: FakeList): Harness {
         h.prompts.push({ sessionId: id, content, mode })
         return { ok: true, value: { accepted: true } }
       }),
+      rename: vi.fn(async (title: string) => {
+        h.renames.push({ sessionId: id, title })
+        return { ok: true, value: { title, seq: 1 } }
+      }),
+      promptAttempted: false,
+      blankBit: initialList.byId[id]?.blank ?? false,
+      firstPromptPendingTurn: false,
+      options: { onEngaged: vi.fn() },
+      notifier: { markDirty: vi.fn() },
     })
   }
 
@@ -197,20 +227,33 @@ function makeHarness(initialList: FakeList): Harness {
   }
 
   apply(ctx as never)
+  h.dispose = () => {
+    for (const cleanup of effectCleanups.splice(0)) cleanup()
+  }
+  activeHarness = h
   return h
 }
 
-function listWith(running: Record<string, boolean>, phase: 'pending' | 'ready' = 'ready'): FakeList {
+function listWith(
+  running: Record<string, boolean>,
+  phase: 'pending' | 'ready' = 'ready',
+  blank: Record<string, boolean> = {},
+): FakeList {
   const ids = Object.keys(running)
   const byId: Record<string, FakeSummary> = {}
   for (const id of ids) {
-    byId[id] = { id, displayTitle: id, running: running[id] ?? false, blank: false, updatedAt: 1 }
+    byId[id] = { id, displayTitle: id, running: running[id] ?? false, blank: blank[id] ?? false, updatedAt: 1 }
   }
   return { ids, byId, current: ids[0], phase }
 }
 
 beforeEach(() => {
   pendingStore.clear()
+})
+
+afterEach(() => {
+  activeHarness?.dispose()
+  activeHarness = undefined
 })
 
 describe('gate wiring', () => {
@@ -383,5 +426,89 @@ describe('gate wiring', () => {
     // Unrelated services are ignored.
     h.emitService('settings', { other: true })
     expect(h.raw.sendSession).toBe(firstWrapper)
+  })
+
+  it('engages a held blank session and gives it its provisional fallback title', async () => {
+    const h = makeHarness(listWith(
+      { A: true, B: false },
+      'ready',
+      { B: true },
+    ))
+    await h.face.sendSession({ sessionId: 'B' }, 'Write a fizz_buzz.py python script now', [], 'queue')
+    expect(h.prompts).toEqual([])
+    const b = h.sessionFaces.get('B')
+    expect(b).toBeDefined()
+    if (b === undefined) return
+    // The harness-internal engagement mirror: the list row leaves blank, so
+    // the New Session flow can mint a second session instead of reusing B.
+    expect(b.promptAttempted).toBe(true)
+    expect(b.blankBit).toBe(false)
+    expect(b.firstPromptPendingTurn).toBe(true)
+    expect(b.options.onEngaged).toHaveBeenCalledTimes(1)
+    expect(b.notifier.markDirty).toHaveBeenCalled()
+    // Provisional title: the same first-five-words fallback the host would
+    // fold when the message releases (byte-identical, 40-byte cap honored).
+    expect(h.renames).toEqual([{ sessionId: 'B', title: 'Write a fizz_buzz.py python script' }])
+  })
+
+  it('does not re-title a held target that is not blank or already titled', async () => {
+    const h = makeHarness(listWith(
+      { A: true, B: false, C: false },
+      'ready',
+      { C: true },
+    ))
+    h.list.byId['C']!.title = 'manual title'
+    await h.face.sendSession({ sessionId: 'B' }, 'to B', [], 'queue')
+    await h.face.sendSession({ sessionId: 'C' }, 'to C', [], 'queue')
+    expect(h.renames).toEqual([])
+    const b = h.sessionFaces.get('B')
+    const c = h.sessionFaces.get('C')
+    expect(b).toBeDefined()
+    expect(c).toBeDefined()
+    if (b === undefined || c === undefined) return
+    // B is non-blank: engagement only mirrors promptAttempted, no flip.
+    expect(b.promptAttempted).toBe(true)
+    expect(b.blankBit).toBe(false)
+    expect(b.options.onEngaged).not.toHaveBeenCalled()
+    // C is blank: full flip, but the existing title wins over the fallback.
+    expect(c.blankBit).toBe(false)
+    expect(c.options.onEngaged).toHaveBeenCalledTimes(1)
+  })
+
+  it('re-checks after an in-flight release so a racing running frame is not lost', async () => {
+    const h = makeHarness(listWith({ A: true, B: false, C: false }))
+    await h.face.sendSession({ sessionId: 'B' }, 'hello B', [], 'queue')
+    await h.face.sendSession({ sessionId: 'C' }, 'hello C', [], 'queue')
+    // A completes: the release starts (B's prompt in flight, releasing=true).
+    h.setList(listWith({ A: false, B: false, C: false }))
+    // B's running frame lands while the release is in flight — without the
+    // after-inflight re-check the claim would outlive it and wedge the queue.
+    h.setList(listWith({ A: false, B: true, C: false }))
+    await flush()
+    expect(h.prompts.map(p => p.sessionId)).toEqual(['B'])
+    // B completes: C releases immediately (the re-check retired the claim).
+    h.setList(listWith({ A: false, B: false, C: false }))
+    await flush()
+    expect(h.prompts.map(p => p.sessionId)).toEqual(['B', 'C'])
+    expect(pendingStore.entries()).toEqual([])
+  })
+
+  it('releases when the claim safety valve elapses even if no further frame arrives', async () => {
+    vi.useFakeTimers()
+    try {
+      const h = makeHarness(listWith({ A: true, B: false, C: false }))
+      await h.face.sendSession({ sessionId: 'B' }, 'hello B', [], 'queue')
+      await h.face.sendSession({ sessionId: 'C' }, 'hello C', [], 'queue')
+      h.setList(listWith({ A: false, B: false, C: false }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(h.prompts.map(p => p.sessionId)).toEqual(['B'])
+      // B's running frame is lost entirely and the host goes quiet: the sweep
+      // timer must wake the queue when the claim expires.
+      await vi.advanceTimersByTimeAsync(15000 + 1000)
+      expect(h.prompts.map(p => p.sessionId)).toEqual(['B', 'C'])
+      expect(pendingStore.entries()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
   })
 })
