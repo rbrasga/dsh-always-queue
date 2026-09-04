@@ -55,6 +55,12 @@ gap entirely on the client side (no dsh source changes, no PR required):
    session its provisional title via `rename` — the deterministic
    first-five-words fallback, byte-identical to the title the host would fold
    when the message releases — so the sidebar shows it like the normal flow.
+   The flip is **re-asserted on every list change**: the harness applies it as
+   a one-shot list mutation that a full host re-fetch (including this plugin's
+   own stuck-gate watchdog re-pull) discards, re-blanking the row and letting
+   the New Session reuse scan silently reuse the held session. Engaged session
+   ids are tracked and flipped back until the session's host-side un-blank
+   sticks (its first turn lands).
 5. A release loop subscribes to the session-list snapshot: when no session
    reports busy (flag or claim), the oldest waiting session's whole batch is
    delivered through `session.prompt` in FIFO order. Failed deliveries are
@@ -79,6 +85,13 @@ gap entirely on the client side (no dsh source changes, no PR required):
 8. An **additional** `conversation.input.dock` entry (id `always-queue`,
    rendered below the official queue strip) shows the held messages of the
    session you are viewing, with a pulsing "waiting" banner.
+
+## Compatibility
+
+Verified end-to-end against **0.1.2-rc.1** (installed runtime): gate wiring,
+FIFO hold/release, cross-session reuse protection, provisional titles, and
+the engagement re-assertion across host list re-fetches (the one case where
+0.1.2-rc.1's `refreshList` drops the harness's one-shot `engaged` mutation).
 
 ## Install
 

@@ -125,7 +125,19 @@ function makeHarness(initialList: FakeList): Harness {
       promptAttempted: false,
       blankBit: initialList.byId[id]?.blank ?? false,
       firstPromptPendingTurn: false,
-      options: { onEngaged: vi.fn() },
+      options: {
+        // Emulates the harness: the 'engaged' mutation flips the row out of
+        // blank (applyMutation case 'engaged') by REPLACING the summary —
+        // captured snapshots keep their pre-flip identity — so a later
+        // re-assert is a no-op unless a full refetch re-blanks the row.
+        onEngaged: vi.fn((target: object) => {
+          const sid = (target as { sessionId?: unknown }).sessionId
+          if (typeof sid !== 'string') return
+          const summary = state.byId[sid]
+          if (summary === undefined || !summary.blank) return
+          state.byId = { ...state.byId, [sid]: { ...summary, blank: false } }
+        }),
+      },
       notifier: { markDirty: vi.fn() },
     })
   }
@@ -456,6 +468,75 @@ describe('gate wiring', () => {
     // Provisional title: the same first-five-words fallback the host would
     // fold when the message releases (byte-identical, 40-byte cap honored).
     expect(h.renames).toEqual([{ sessionId: 'B', title: 'Write a fizz_buzz.py python script' }])
+  })
+
+  it('re-asserts the held session\'s un-blank after a full list refetch re-blanks it', async () => {
+    const h = makeHarness(listWith(
+      { A: true, B: false },
+      'ready',
+      { B: true },
+    ))
+    await h.face.sendSession({ sessionId: 'B' }, 'held first send here now', [], 'queue')
+    const b = h.sessionFaces.get('B')
+    expect(b).toBeDefined()
+    if (b === undefined) return
+    expect(b.blankBit).toBe(false)
+    expect(b.options.onEngaged).toHaveBeenCalledTimes(1)
+
+    // Simulate a full list refetch (the plugin's own stuck-gate watchdog
+    // calls sessions.refresh): the harness replaces the host baseline — B is
+    // blank again — and re-applies the host blank state to the Session,
+    // dropping the one-shot 'engaged' mutation recorded at hold time.
+    b.blankBit = true
+    h.setList(listWith(
+      { A: true, B: false },
+      'ready',
+      { B: true },
+    ))
+    await flush()
+
+    // The list-change hook re-asserts: B's row leaves blank again, so the
+    // New Session reuse scan cannot mistake the held session for a fresh
+    // slot ("New Session does nothing").
+    expect(b.blankBit).toBe(false)
+    expect(b.firstPromptPendingTurn).toBe(true)
+    expect(b.options.onEngaged).toHaveBeenCalledTimes(2)
+    // The message is still held (A still runs): nothing was released.
+    expect(h.prompts).toEqual([])
+    expect(pendingStore.entries().map(e => e.sessionId)).toEqual(['B'])
+
+    // A completes: B's batch releases (the held prompt is sent).
+    h.setList(listWith({ A: false, B: false }))
+    await flush()
+    expect(h.prompts.map(p => p.sessionId)).toEqual(['B'])
+    // B's running flag lands (the host un-blanks for good): the id is
+    // pruned, so later list changes never re-engage it (no spurious
+    // 'engaged' mutations).
+    h.setList(listWith({ A: false, B: true }))
+    await flush()
+    h.setList(listWith({ A: false, B: false }))
+    await flush()
+    expect(b.options.onEngaged).toHaveBeenCalledTimes(2)
+  })
+
+  it('does not re-assert sessions the plugin never engaged', async () => {
+    const h = makeHarness(listWith(
+      { A: true, B: false },
+      'ready',
+      { B: true },
+    ))
+    // No send to B: a refetch re-blank must not invent an engagement.
+    h.setList(listWith(
+      { A: true, B: false },
+      'ready',
+      { B: true },
+    ))
+    await flush()
+    const b = h.sessionFaces.get('B')
+    expect(b).toBeDefined()
+    if (b === undefined) return
+    expect(b.options.onEngaged).not.toHaveBeenCalled()
+    expect(b.blankBit).toBe(true)
   })
 
   it('does not re-title a held target that is not blank or already titled', async () => {

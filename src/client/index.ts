@@ -187,6 +187,17 @@ export function apply(ctx: ClientContext): void {
   // ----- Gate state.
   /** SessionId -> claim timestamp: busy from turn start until the running flag lands. */
   const claims = new Map<string, { at: number }>()
+  /**
+   * SessionIds this plugin engaged client-side (a held first send flipped the
+   * row un-blank locally while the host still reports the session blank). The
+   * flip is ONE-SHOT: the harness applies it as a single 'engaged' list
+   * mutation, and a full list re-fetch (sessions.refresh — including this
+   * plugin's own stuck-gate watchdog) replaces the host baseline and drops
+   * the mutation, re-blanking the row. reassertEngaged re-flips those rows on
+   * every list change so the New Session reuse scan can never mistake a held
+   * session for a fresh slot.
+   */
+  const engagedIds = new Set<string>()
   let releasing = false
   /** A check arrived while a release was in flight: re-run it when that settles. */
   let releaseQueuedAfterInflight = false
@@ -373,12 +384,67 @@ export function apply(ctx: ClientContext): void {
         s.firstPromptPendingTurn = true
         const options = s.options as { onEngaged?: (session: object) => void } | undefined
         options?.onEngaged?.(session)
+        const sid = s.sessionId
+        if (typeof sid === 'string') engagedIds.add(sid)
       }
       const notifier = s.notifier as { markDirty?: () => void } | undefined
       notifier?.markDirty?.()
     } catch {
       /* best-effort only */
     }
+  }
+
+  /**
+   * Re-assert the client-side un-blank on every engaged session a full list
+   * re-fetch re-blanked (the one-shot 'engaged' mutation is dropped when a
+   * refetch lands, and the harness re-applies the host blank state to the
+   * Session itself). Without this, a held session's row reports blank again:
+   * the New Session reuse scan silently reuses it and the next prompt joins
+   * its queue instead of opening a new session ("New Session does nothing").
+   * Idempotent: flipping re-records the 'engaged' mutation, which the harness
+   * replays if another refetch is in flight.
+   * @param list - fresh list snapshot (any phase; non-ready is skipped).
+   */
+  const reassertEngaged = (list: SessionListState): void => {
+    if (list.phase !== 'ready' || engagedIds.size === 0) return
+    let flipped = 0
+    for (const id of [...engagedIds]) {
+      const summary = list.byId[id as SessionId]
+      if (summary === undefined) {
+        // Session left the list: nothing left to keep un-blanked.
+        engagedIds.delete(id)
+        continue
+      }
+      if (summary.blank !== true) {
+        // Host-side un-blank stuck (a turn landed): the refetch baseline
+        // carries blank false from now on, so re-assertion is never needed.
+        if (pendingStore.entries().every(entry => entry.sessionId !== id)) {
+          engagedIds.delete(id)
+        }
+        continue
+      }
+      const binding = sessions.binding(id as SessionId)
+      const session = (binding?.session ?? undefined) as Record<string, unknown> | undefined
+      if (session === undefined) {
+        log('re-assert: no binding for', id, '— cannot re-flip (row stays blank until release)')
+        continue
+      }
+      try {
+        if (session.blankBit === true) {
+          session.blankBit = false
+          session.firstPromptPendingTurn = true
+        }
+        const options = session.options as { onEngaged?: (session: object) => void } | undefined
+        options?.onEngaged?.(session)
+        const notifier = session.notifier as { markDirty?: () => void } | undefined
+        notifier?.markDirty?.()
+        flipped += 1
+        log('re-assert: un-blank re-flipped for', id, '(refetch dropped the engaged mutation)')
+      } catch {
+        /* best-effort only */
+      }
+    }
+    if (flipped > 0) log('re-assert: done — flipped', flipped, 'engaged row(s); tracking', [...engagedIds].join(','))
   }
 
   /**
@@ -437,6 +503,9 @@ export function apply(ctx: ClientContext): void {
 
     const list = sessions.list.getSnapshot()
     if (list.phase !== 'ready') return passThrough()
+    // A refetch may have re-blanked an engaged row between sends: heal it
+    // before the verdict so the reuse scan never sees a stale blank.
+    reassertEngaged(list)
 
     const targetRunning = list.byId[targetId as SessionId]?.running === true
     // A steer can never start a session: let the host handle (or reject) it
@@ -519,10 +588,13 @@ export function apply(ctx: ClientContext): void {
     // and give it its provisional title — the same first-five-words text the
     // host would derive when the message releases.
     const binding = sessions.binding(targetId as SessionId)
+    // Capture the row BEFORE the engage flip: the provisional-title decision
+    // must judge the pre-flip (blank) state, never the locally un-blanked one.
+    const targetSummary = list.byId[targetId as SessionId]
     engageSession(binding?.session)
     provisionTitle(
       binding === undefined ? undefined : { session: binding.session },
-      list.byId[targetId as SessionId],
+      targetSummary,
       firstTextOf(content),
     )
 
@@ -582,6 +654,9 @@ export function apply(ctx: ClientContext): void {
     }
     const list = sessions.list.getSnapshot()
     retireClaims(list)
+    // Every list change (including a stuck-gate refetch completing) re-asserts
+    // the client-side un-blank the harness's one-shot mutation may have lost.
+    reassertEngaged(list)
     if (list.phase !== 'ready') {
       resetStuckGate()
       log('release: skip (list phase', list.phase + ')')
