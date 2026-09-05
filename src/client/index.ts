@@ -95,6 +95,25 @@ const RELEASE_RETRY_MS = 2000
 const RELEASE_RETRY_MAX_MS = 60000
 
 /**
+ * Release-poll cadence while anything is held: the release check runs on
+ * this timer INDEPENDENTLY of list events, so a completed session's queued
+ * successor starts within one poll even if its status frame was lost, the
+ * list subscription died, or no further event ever arrives. (Contract:
+ * the queue pops within ~15 s of a session completing — 5 s gives 3x margin
+ * over frame latency.)
+ */
+const RELEASE_POLL_MS = 5000
+
+/**
+ * A release is STUCK when its prompt RPC has been in flight this long
+ * without settling: the connection is dead and the finally-block that
+ * clears releasing will never run. The poller force-resets it (a hung
+ * delivery may then be resent — a duplicate is preferable to a silently
+ * lost message).
+ */
+const STUCK_RELEASE_MS = 30000
+
+/**
  * Stuck-gate watchdog: while the queue is non-empty and the gate stays closed
  * this long (with no release in flight), the page re-pulls the host list — a
  * client-side running flag that missed its status frame (lost frame, quiet
@@ -199,6 +218,8 @@ export function apply(ctx: ClientContext): void {
    */
   const engagedIds = new Set<string>()
   let releasing = false
+  /** When the in-flight release started (the stuck-release watchdog). */
+  let releasingSince = 0
   /** A check arrived while a release was in flight: re-run it when that settles. */
   let releaseQueuedAfterInflight = false
   let retryTimer: ReturnType<typeof setTimeout> | undefined
@@ -687,9 +708,23 @@ export function apply(ctx: ClientContext): void {
     // A check arriving mid-release (a status frame racing the RPC) re-runs
     // after the in-flight batch settles, so no frame is ever lost.
     if (releasing) {
-      releaseQueuedAfterInflight = true
-      log('release: skip (release in flight — re-check queued)')
-      return
+      if (releasingSince !== 0 && Date.now() - releasingSince > STUCK_RELEASE_MS) {
+        // The prompt RPC never settled: the connection is dead and the
+        // finally-block that clears releasing will never run. Without this,
+        // every later check skips forever — the queue freezes with no
+        // spinner anywhere. Force-reset; a hung delivery may be resent.
+        console.error(LOG, 'release: STUCK — prompt RPC in flight for',
+          Date.now() - releasingSince, 'ms without settling; forcing reset',
+          '(a hung delivery may be resent — a duplicate beats a lost message)')
+        releasing = false
+        releasingSince = 0
+        inFlight.clear()
+        // fall through: re-run the check on the current state
+      } else {
+        releaseQueuedAfterInflight = true
+        log('release: skip (release in flight — re-check queued)')
+        return
+      }
     }
     const list = sessions.list.getSnapshot()
     retireClaims(list)
@@ -726,6 +761,7 @@ export function apply(ctx: ClientContext): void {
 
     resetStuckGate() // gate open: the release starts
     releasing = true
+    releasingSince = Date.now()
     log('release: start batch for session', batch[0]?.sessionId, '(', batch.length, 'entries)')
     void (async () => {
       let releasedSession: string | undefined
@@ -796,6 +832,7 @@ export function apply(ctx: ClientContext): void {
         }
       } finally {
         releasing = false
+        releasingSince = 0
         if (releaseQueuedAfterInflight) {
           releaseQueuedAfterInflight = false
           checkRelease()
@@ -819,26 +856,62 @@ export function apply(ctx: ClientContext): void {
     }
   }, 'dsh-always-queue: release loop')
 
-  // Diagnostics heartbeat: while anything is held, a 30 s console trace of
-  // the whole gate state — the debug surface for "my queued session never
-  // starts". Quiet while the queue is empty (no console noise in normal use).
+  // Release poller: while anything is held, re-run the release check on a
+  // fixed cadence INDEPENDENT of list events. A completed session's queued
+  // successor then starts within one poll (5 s) even if its status frame
+  // was lost, the list subscription died, or no further event ever arrives —
+  // the hard guarantee behind "the queue pops within 15 s of a session
+  // completing". The poller also gets the stuck-release watchdog its ticks.
+  ctx.effect(() => {
+    log('release poller armed (every', RELEASE_POLL_MS, 'ms while anything is held)')
+    const timer = setInterval(() => {
+      if (pendingStore.entries().length === 0) return
+      checkRelease()
+    }, RELEASE_POLL_MS)
+    return () => {
+      log('release poller torn down')
+      clearInterval(timer)
+    }
+  }, 'dsh-always-queue: release poller')
+
+  // Diagnostics heartbeat: while anything is held, a 5 s console trace of
+  // the whole gate state INCLUDING the verdict the next check will take —
+  // the debug surface for "my queued session never starts". Quiet while the
+  // queue is empty (no console noise in normal use).
   ctx.effect(() => {
     const timer = setInterval(() => {
       const entries = pendingStore.entries()
       if (entries.length === 0) return
       const list = sessions.list.getSnapshot()
+      const busy = list.phase === 'ready' ? busyIds(list) : []
+      let verdict: string
+      if (releasing) {
+        verdict = releasingSince !== 0 && Date.now() - releasingSince > STUCK_RELEASE_MS
+          ? 'STUCK release — force-reset on next poll'
+          : 'release in flight (' + (releasingSince === 0 ? '?' : Date.now() - releasingSince) + ' ms)'
+      } else if (list.phase !== 'ready') {
+        verdict = 'list ' + list.phase
+      } else if (busy.length > 0) {
+        verdict = 'hold — gate closed by ' + JSON.stringify(describeBusy(list, busy))
+      } else if (entries.every(e => inFlight.has(e.id))) {
+        verdict = 'all entries in flight'
+      } else {
+        verdict = 'GATE OPEN — will release on next poll'
+      }
       log('heartbeat', {
         phase: list.phase,
+        verdict,
         pending: entries.map(e => ({
           id: e.id, sessionId: e.sessionId, attempts: e.attempts,
           ageMs: Date.now() - e.queuedAt,
         })),
-        busy: describeBusy(list, busyIds(list)),
+        busy: describeBusy(list, busy),
         claims: [...claims.entries()].map(([id, c]) => ({ id, ageMs: Date.now() - c.at })),
+        inFlight: [...inFlight],
         releasing,
         gateClosedForMs: gateClosedSince === undefined ? 0 : Date.now() - gateClosedSince,
       })
-    }, 30000)
+    }, 5000)
     return () => { clearInterval(timer) }
   }, 'dsh-always-queue: diagnostics heartbeat')
 

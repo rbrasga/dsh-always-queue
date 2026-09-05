@@ -70,6 +70,16 @@ gap entirely on the client side (no dsh source changes, no PR required):
    only drops are the unrecoverable ones (the target session no longer
    exists on the host), and even those are announced via `console.error`
    plus a composer notice.
+   A **5 s release poller** re-runs that check on a fixed cadence while
+   anything is held, independently of list events — so a completed
+   session's queued successor starts within ~5 s even if its status frame
+   was lost, the list subscription died, or no further event ever arrives
+   (the "queue pops within 15 s of completion" guarantee). And a release
+   whose `session.prompt` RPC never settles (dead connection) would
+   otherwise pin the `releasing` flag forever and wedge the queue with no
+   spinner anywhere; a **stuck-release watchdog** force-resets it after
+   30 s (a hung delivery may be resent — a duplicate is preferable to a
+   silently lost message).
 6. A **stuck-gate watchdog**: if the gate stays closed with a non-empty
    queue for 60 s, the page re-pulls the host session list (read-only; the
    gate is never forced open). A client-side `running` flag that missed its
@@ -77,21 +87,29 @@ gap entirely on the client side (no dsh source changes, no PR required):
    within a minute instead of holding the queue forever.
 7. **Diagnostics**: every gate decision, claim transition, release attempt
    and queue mutation is traced to the browser console under the
-   `[dsh-always-queue]` prefix, plus a 30 s state heartbeat while anything
-   is held (`pending` / `busy` (host `flag` vs plugin `claim`) / `claims`/
-   `releasing` / `gateClosedForMs`). That is the debug surface for "my
-   queued session never starts": the busy rows name the exact session(s)
-   holding the gate.
+   `[dsh-always-queue]` prefix, plus a 5 s state heartbeat while anything
+   is held (`phase` / `verdict` / `pending` / `busy` (host `flag` vs
+   plugin `claim`) / `claims` / `inFlight` / `releasing` /
+   `gateClosedForMs`). The `verdict` field states exactly what the next
+   check will do (`GATE OPEN — will release on next poll`,
+   `hold — gate closed by [...]`, `release in flight (N ms)`, or
+   `STUCK release — force-reset on next poll`). That is the debug surface
+   for "my queued session never starts": the busy rows name the exact
+   session(s) holding the gate.
 8. An **additional** `conversation.input.dock` entry (id `always-queue`,
    rendered below the official queue strip) shows the held messages of the
-   session you are viewing, with a pulsing "waiting" banner.
+   session you are viewing, with a pulsing "waiting" banner. While a session
+   holds the gate, the banner names it ("waiting for X to finish or pause"),
+   so a held queue is never a mystery.
 
 ## Compatibility
 
 Verified end-to-end against **0.1.2-rc.1** (installed runtime): gate wiring,
-FIFO hold/release, cross-session reuse protection, provisional titles, and
+FIFO hold/release, cross-session reuse protection, provisional titles,
 the engagement re-assertion across host list re-fetches (the one case where
-0.1.2-rc.1's `refreshList` drops the harness's one-shot `engaged` mutation).
+0.1.2-rc.1's `refreshList` drops the harness's one-shot `engaged`
+mutation), and the stuck-release recovery (a prompt RPC that never settles
+force-resets on the poller and the held message still delivers).
 
 ## Install
 
@@ -123,18 +141,25 @@ removing it is `npx @deepseek-ai/dsh plugin --profile web remove dsh-always-queu
 ## Troubleshooting a stuck queue
 
 1. Open the browser DevTools console on the GUI page and filter for
-   `dsh-always-queue`. While anything is held, a 30 s heartbeat prints the
-   whole gate state; the `busy` list names the session(s) holding the gate
-   and whether each hold is a host `running` **flag** or a plugin **claim**.
+   `dsh-always-queue`. While anything is held, a 5 s heartbeat prints the
+   whole gate state including a `verdict` (what the next check will do);
+   the `busy` list names the session(s) holding the gate and whether each
+   hold is a host `running` **flag** or a plugin **claim**.
 2. If a `flag` keeps holding the gate while that session is visibly idle,
    the watchdog re-pulls the host list after 60 s (log:
    `stuck-gate: ... re-pulling host list`); a following `release: start
-   batch` means the queue recovered on its own.
-3. Repeated `release: FAILED` lines mean the host is rejecting the prompt
+   batch` means the queue recovered on its own. A queue that sits still
+   with no busy session and `verdict: GATE OPEN — will release on next
+   poll` should be impossible — report it, that is a plugin bug.
+3. A `release: STUCK — prompt RPC in flight ...` line means the connection
+   died mid-delivery; the next poll force-resets the release and the held
+   message goes out (a hung delivery may be resent once — a duplicate beats
+   a lost message).
+4. Repeated `release: FAILED` lines mean the host is rejecting the prompt
    RPC; the `error` JSON names the code (e.g. `model-unavailable` when no
    adapter serves the session's model). The message stays queued and keeps
    retrying.
-4. `dock: user removed/pulled back entry` lines rule out manual removal.
+5. `dock: user removed/pulled back entry` lines rule out manual removal.
 
 ## Limitations
 

@@ -346,6 +346,47 @@ describe('gate wiring', () => {
     expect(pendingStore.entries()).toEqual([])
   })
 
+  it('force-resets a stuck release (prompt RPC that never settles) and delivers on a later poll', async () => {
+    vi.useFakeTimers()
+    try {
+      const h = makeHarness(listWith({ A: true, B: false }))
+      const face = h.sessionFaces.get('B')
+      if (face === undefined) throw new Error('no face for B')
+      // First prompt call hangs forever (dead connection — the RPC never
+      // settles, so the release IIFE's finally-block never runs either).
+      let calls = 0
+      face.prompt = vi.fn((_c: readonly unknown[], _m: string) => {
+        calls += 1
+        if (calls === 1) return new Promise<never>(() => { /* never settles */ })
+        h.prompts.push({ sessionId: 'B', content: [{ type: 'text', text: 'story' }], mode: _m })
+        return Promise.resolve({ ok: true, value: { accepted: true } })
+      })
+
+      // Held while A runs.
+      await h.face.sendSession({ sessionId: 'B' }, 'story', [], 'queue')
+      expect(h.prompts).toHaveLength(0)
+
+      // A completes: the release starts, its prompt call hangs → stuck.
+      h.setList(listWith({ A: false, B: false }))
+      await vi.advanceTimersByTimeAsync(0)
+      expect(calls).toBe(1)
+
+      // Poll ticks (5 s cadence) skip while the release is "in flight"...
+      await vi.advanceTimersByTimeAsync(5000 * 6)
+      expect(calls).toBe(1)
+      expect(h.prompts).toHaveLength(0)
+
+      // ...until the stuck-release watchdog (30 s) trips on a tick:
+      // force-reset, re-run the check, deliver.
+      await vi.advanceTimersByTimeAsync(5000)
+      expect(calls).toBe(2)
+      expect(h.prompts.map(p => p.sessionId)).toEqual(['B'])
+      expect(pendingStore.entries()).toEqual([])
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('passes everything through when no session runs', async () => {
     const h = makeHarness(listWith({ B: false }))
     await h.face.sendSession({ sessionId: 'B' }, 'go', [], 'queue')
