@@ -271,6 +271,39 @@ export function apply(ctx: ClientContext): void {
     }))
 
   /**
+   * The titles of the session(s) holding the gate (host running flag or
+   * plugin claim) — what the dock banner and the hold notice show: a queued
+   * message must never look stalled without saying WHO is running.
+   * @param list - fresh list snapshot.
+   * @param busy - busy ids (from busyIds).
+   */
+  const holderNames = (list: SessionListState, busy: readonly string[]): string => {
+    if (busy.length === 0) return ''
+    const names = busy
+      .map(id => list.byId[id as SessionId])
+      .filter((s): s is NonNullable<typeof s> => s !== undefined)
+      .map(s => s.title || s.displayTitle || '')
+      .filter(Boolean)
+    return names.length > 0 ? names.join(', ') : busy.length + ' session(s)'
+  }
+
+  /**
+   * External store for the current gate-holder text (the dock banner reads
+   * it with useSyncExternalStore). Republished on every list change and
+   * send; the string identity gates re-renders.
+   */
+  const holdersState: { text: string; listeners: Set<() => void> } = {
+    text: '',
+    listeners: new Set<() => void>(),
+  }
+  const publishHolders = (list: SessionListState): void => {
+    const text = list.phase === 'ready' ? holderNames(list, busyIds(list)) : ''
+    if (text === holdersState.text) return
+    holdersState.text = text
+    for (const fn of [...holdersState.listeners]) fn()
+  }
+
+  /**
    * Stuck-gate state reset: the queue is empty or the gate is open, so no
    * re-validation may be pending.
    */
@@ -341,12 +374,17 @@ export function apply(ctx: ClientContext): void {
     }
   }
 
-  /** Best-effort composer notice that a message was held (no scope, silent). */
-  const notifyHeld = (sessionId: string): void => {
+  /**
+   * Best-effort composer notice that a message was held (no scope, silent).
+   * Names the session(s) holding the gate so the wait is never a mystery.
+   * @param sessionId - the held message's target session.
+   * @param holders - gate-holder text at hold time ('' when unknown).
+   */
+  const notifyHeld = (sessionId: string, holders: string): void => {
     try {
       const actx = sessions.scope(sessionId as SessionId)
       if (actx === undefined) return
-      hubInput?.for(actx).notify('info', t('queued'))
+      hubInput?.for(actx).notify('info', holders !== '' ? t('queued.by', { who: holders }) : t('queued'))
     } catch {
       /* best-effort only */
     }
@@ -506,6 +544,7 @@ export function apply(ctx: ClientContext): void {
     // A refetch may have re-blanked an engaged row between sends: heal it
     // before the verdict so the reuse scan never sees a stale blank.
     reassertEngaged(list)
+    publishHolders(list)
 
     const targetRunning = list.byId[targetId as SessionId]?.running === true
     // A steer can never start a session: let the host handle (or reject) it
@@ -598,7 +637,7 @@ export function apply(ctx: ClientContext): void {
       firstTextOf(content),
     )
 
-    notifyHeld(targetId)
+    notifyHeld(targetId, holderNames(list, busy))
     checkRelease() // close the race: the busy session may have just finished
     return prop === 'sendSession' ? { kind: 'success' } : undefined
   }
@@ -657,6 +696,8 @@ export function apply(ctx: ClientContext): void {
     // Every list change (including a stuck-gate refetch completing) re-asserts
     // the client-side un-blank the harness's one-shot mutation may have lost.
     reassertEngaged(list)
+    // ...and republishes the gate-holder text for the dock banner.
+    publishHolders(list)
     if (list.phase !== 'ready') {
       resetStuckGate()
       log('release: skip (list phase', list.phase + ')')
@@ -815,6 +856,11 @@ export function apply(ctx: ClientContext): void {
       if (dockFace === undefined) throw new Error('always-queue dock: conversation service unavailable')
       return {
         setDraft: (text) => { dockFace.input.for(actx).actions.setDraft(text) },
+        holdersSubscribe: (fn: () => void) => {
+          holdersState.listeners.add(fn)
+          return () => { holdersState.listeners.delete(fn) }
+        },
+        holdersSnapshot: () => holdersState.text,
       }
     },
   }, AlwaysQueueDock))

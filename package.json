@@ -1,6 +1,6 @@
 {
   "name": "dsh-always-queue",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "type": "module",
   "description": "Single-session gate for the DeepSeek Harness web GUI: messages sent to an idle session while any other session is in progress are held in a cross-session queue and released FIFO only after the running session completes or pauses — no send-now for held messages, per-session in-turn queueing and steer untouched. A cordis client plugin, no dsh source changes.",
   "repository": {

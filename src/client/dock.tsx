@@ -25,7 +25,17 @@ import css from './dock.module.css'
 export interface AlwaysQueueDockInjected {
   /** Back-fill the composer draft (the pull-back-to-composer path). */
   setDraft: (text: string) => void
+  /** Subscribe to gate-holder text changes (the banner names the blocker). */
+  holdersSubscribe?: (fn: () => void) => () => void
+  /** Current gate-holder text ('' when nothing holds the gate). */
+  holdersSnapshot?: () => string
 }
+
+/** No-holder fallback so the dock still renders on older registration shapes. */
+const NO_HOLDERS = {
+  subscribe: () => () => undefined,
+  get: () => '',
+} as const
 
 /** Full props of the dock entry: InputZone owner + session kit + locale seat. */
 export type AlwaysQueueDockProps =
@@ -35,11 +45,16 @@ export type AlwaysQueueDockProps =
  * The pending strip; renders nothing while the viewed session holds nothing
  * (the gate, the release loop, and this view all share the pending store).
  */
-export function AlwaysQueueDock({ sessionId, input, setDraft, t }: AlwaysQueueDockProps) {
+export function AlwaysQueueDock({ sessionId, input, setDraft, t, holdersSubscribe, holdersSnapshot }: AlwaysQueueDockProps) {
   const sid = sessionId ?? ''
   const entries = useSyncExternalStore(
     pendingStore.subscribe,
     () => pendingStore.getSnapshotFor(sid),
+  )
+  // Who is holding the gate: the banner says so instead of just "waiting".
+  const holders = useSyncExternalStore(
+    holdersSubscribe ?? NO_HOLDERS.subscribe,
+    holdersSnapshot ?? NO_HOLDERS.get,
   )
   if (entries.length === 0) return null
 
@@ -58,7 +73,9 @@ export function AlwaysQueueDock({ sessionId, input, setDraft, t }: AlwaysQueueDo
       <div className={css.panel}>
         <div className={css.banner} role="status">
           <span className={css.bannerDot} aria-hidden />
-          {t('waiting', { n: entries.length })}
+          {holders !== ''
+            ? t('waiting.heldBy', { n: entries.length, who: holders })
+            : t('waiting', { n: entries.length })}
         </div>
         <ul className={css.list}>
           {entries.map((entry) => {

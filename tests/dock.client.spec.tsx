@@ -20,6 +20,8 @@ vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
 
 const DICT: Record<string, string> = {
   'waiting': 'WAITING({n})',
+  'waiting.heldBy': 'WAITING_HELD_BY {who}',
+  'queued.by': 'held-by {who}',
   'noText': '(image message)',
   'hasImage': 'image',
   'pullBack': 'pullBack',
@@ -55,6 +57,23 @@ describe('AlwaysQueueDock', () => {
     pendingStore.add({ sessionId: 'OTHER', content: [{ type: 'text', text: 'elsewhere' }] })
     const { container } = render(<AlwaysQueueDock {...propsFor()} />)
     expect(container.querySelector('[data-always-queue-dock]')).toBeNull()
+  })
+
+  it('names the gate holder in the banner when a session holds the gate', () => {
+    pendingStore.add({ sessionId: 'S1', content: [{ type: 'text', text: 'waiting behind A' }] })
+    const t = (key: string, params?: Record<string, unknown>) =>
+      (DICT[key] ?? key).replace('{n}', String(params?.n ?? '')).replace('{who}', String(params?.who ?? ''))
+    render(
+      <AlwaysQueueDock
+        {...propsFor({
+          t,
+          holdersSubscribe: () => () => undefined,
+          holdersSnapshot: () => 'Alpha, Beta',
+        })}
+      />,
+    )
+    const banner = document.querySelector('[role="status"]')
+    expect(banner?.textContent).toBe('WAITING_HELD_BY Alpha, Beta')
   })
 
   it('renders a waiting banner plus one row per held message of the viewed session', () => {

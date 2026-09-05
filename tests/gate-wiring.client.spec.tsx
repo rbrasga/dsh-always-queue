@@ -302,7 +302,9 @@ describe('gate wiring', () => {
       ['B', [{ type: 'text', text: 'hello B' }]],
       ['C', [{ type: 'text', text: 'hello C' }]],
     ])
-    expect(h.notify).toHaveBeenCalledWith('info', 'queued')
+    // The hold notice names the gate holder (A runs; the fake locale t passes
+    // the key through, so the {who} interpolation is the plugin's contract).
+    expect(h.notify).toHaveBeenCalledWith('info', 'queued.by')
 
     // A send to the RUNNING session passes through with its mode intact.
     await h.face.sendSession({ sessionId: 'A' }, 'steer A', [], 'steer')
